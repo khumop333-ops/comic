@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { supabase } from "@/lib/supabase";
+import { supabase, getSupabase, friendlySupabaseError } from "@/lib/supabase";
 import { inngest } from "@/inngest/client";
 
 export const runtime = "nodejs";
@@ -10,12 +10,17 @@ type GenerateRequestBody = {
   scriptLines: string[];
 };
 
+// Actual DB schema (from Supabase project hzegkbmgkvwhvtqdkuqr):
+// characters(id, created_at, name, description, reference_image_url)
+// comics(id, created_at, title, status)
+// comic_panels(id, comic_id, character_id, panel_index, prompt_used, image_url, status)
+// Note: spec used different names (character_id on comics, prompt/panel_number) — we handle both via fallback.
+
 export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as GenerateRequestBody;
     const { title, characterId, scriptLines } = body;
 
-    // Validation
     if (!title || typeof title !== "string" || !title.trim()) {
       return NextResponse.json({ error: "title is required" }, { status: 400 });
     }
@@ -34,7 +39,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "scriptLines contains no valid prompts" }, { status: 400 });
     }
 
-    // Fetch character reference_image_url from characters table
+    // Validate Supabase config early — gives helpful error instead of Invalid Compact JWS later
+    try {
+      getSupabase();
+    } catch (configErr) {
+      return NextResponse.json({ error: String(configErr) }, { status: 500 });
+    }
+
+    // Fetch character reference_image_url
     const { data: character, error: charError } = await supabase
       .from("characters")
       .select("id, reference_image_url")
@@ -42,39 +54,60 @@ export async function POST(req: NextRequest) {
       .single();
 
     if (charError || !character) {
-      return NextResponse.json(
-        { error: `Character not found: ${charError?.message || characterId}` },
-        { status: 404 }
-      );
+      const msg = friendlySupabaseError(charError as unknown as { message: string }, "Fetch character") || charError?.message;
+      return NextResponse.json({ error: `Character not found: ${msg || characterId}` }, { status: 404 });
     }
 
     const characterReferenceUrl = (character as { reference_image_url: string }).reference_image_url;
-
     if (!characterReferenceUrl) {
-      return NextResponse.json(
-        { error: "Character is missing reference_image_url" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Character is missing reference_image_url" }, { status: 400 });
     }
 
-    // Create new row in comics
-    const { data: comic, error: comicError } = await supabase
-      .from("comics")
-      .insert({
-        title: title.trim(),
-        character_id: characterId,
-      })
-      .select("id, title, character_id")
-      .single();
+    // Create row in comics — actual schema: title, status (no character_id)
+    // Try with status, fallback to just title for compatibility
+    let comic: { id: string } | null = null;
+    let comicError: { message: string } | null = null;
 
-    if (comicError || !comic) {
-      return NextResponse.json({ error: `Failed to create comic: ${comicError?.message}` }, { status: 500 });
+    // Attempt 1: title + status
+    const attempt1 = await (supabase.from("comics") as unknown as { insert: (v: unknown) => { select: (s: string) => { single: () => Promise<{ data: { id: string } | null; error: { message: string } | null }> } } }).insert({ title: title.trim(), status: "generating" }).select("id, title, status").single();
+    if (!attempt1.error && attempt1.data) {
+      comic = attempt1.data as { id: string };
+    } else {
+      // Attempt 2: just title (if status column missing or other)
+      const attempt2 = await (supabase.from("comics") as unknown as { insert: (v: unknown) => { select: (s: string) => { single: () => Promise<{ data: { id: string } | null; error: { message: string } | null }> } } }).insert({ title: title.trim() }).select("id, title").single();
+      if (!attempt2.error && attempt2.data) {
+        comic = attempt2.data as { id: string };
+      } else {
+        // Attempt 3: legacy spec with character_id (for projects that have it)
+        const attempt3 = await (supabase.from("comics") as unknown as { insert: (v: unknown) => { select: (s: string) => { single: () => Promise<{ data: { id: string } | null; error: { message: string } | null }> } } }).insert({ title: title.trim(), character_id: characterId }).select("id").single();
+        if (!attempt3.error && attempt3.data) {
+          comic = attempt3.data as { id: string };
+        } else {
+          comicError = attempt3.error || attempt2.error || attempt1.error;
+        }
+      }
     }
 
-    const comicId = (comic as { id: string }).id;
+    if (!comic) {
+      const friendly = friendlySupabaseError(comicError, "Create comic");
+      return NextResponse.json({ error: friendly || comicError?.message || "Failed to create comic" }, { status: 500 });
+    }
 
-    // Insert placeholder rows into comic_panels with status: 'pending'
-    const panelRows = cleanScriptLines.map((prompt, idx) => ({
+    const comicId = comic.id;
+
+    // Insert placeholder rows into comic_panels with correct schema:
+    // actual: comic_id, character_id, panel_index, prompt_used, status, image_url
+    const panelRowsActual = cleanScriptLines.map((promptUsed, idx) => ({
+      comic_id: comicId,
+      character_id: characterId,
+      panel_index: idx,
+      prompt_used: promptUsed,
+      status: "pending" as const,
+      image_url: null,
+    }));
+
+    // Legacy fallback (if schema matches spec): comic_id, prompt, panel_number
+    const panelRowsLegacy = cleanScriptLines.map((prompt, idx) => ({
       comic_id: comicId,
       prompt,
       status: "pending" as const,
@@ -82,28 +115,42 @@ export async function POST(req: NextRequest) {
       order_index: idx,
     }));
 
-    const { data: insertedPanels, error: panelsError } = await supabase
-      .from("comic_panels")
-      .insert(panelRows)
-      .select("id, comic_id, prompt, status");
+    let insertedPanels: Array<{ id: string; comic_id: string; prompt_used?: string; prompt?: string; status: string }> | null = null;
+    let panelsError: { message: string } | null = null;
 
-    if (panelsError || !insertedPanels) {
-      // Attempt cleanup of comic if panel insert fails
-      await supabase.from("comics").delete().eq("id", comicId);
-      return NextResponse.json({ error: `Failed to create panels: ${panelsError?.message}` }, { status: 500 });
+    const actualInsert: { data: typeof insertedPanels; error: { message: string } | null } = await (supabase.from("comic_panels") as unknown as { insert: (v: unknown) => { select: (s: string) => Promise<{ data: typeof insertedPanels; error: { message: string } | null }> } }).insert(panelRowsActual).select("id, comic_id, prompt_used, status, panel_index") as unknown as { data: typeof insertedPanels; error: { message: string } | null };
+    if (!actualInsert.error && actualInsert.data) {
+      insertedPanels = actualInsert.data as unknown as typeof insertedPanels;
+    } else {
+      // Try legacy column names
+      const legacyInsert: { data: typeof insertedPanels; error: { message: string } | null } = await (supabase.from("comic_panels") as unknown as { insert: (v: unknown) => { select: (s: string) => Promise<{ data: typeof insertedPanels; error: { message: string } | null }> } }).insert(panelRowsLegacy).select("id, comic_id, prompt, status") as unknown as { data: typeof insertedPanels; error: { message: string } | null };
+      if (!legacyInsert.error && legacyInsert.data) {
+        insertedPanels = legacyInsert.data as unknown as typeof insertedPanels;
+      } else {
+        panelsError = (legacyInsert.error || actualInsert.error) as { message: string };
+      }
     }
 
-    const panels = insertedPanels as Array<{ id: string; comic_id: string; prompt: string; status: string }>;
+    if (!insertedPanels) {
+      await supabase.from("comics").delete().eq("id", comicId);
+      const friendly = friendlySupabaseError(panelsError, "Create panels");
+      return NextResponse.json({ error: friendly || panelsError?.message || "Failed to create panels" }, { status: 500 });
+    }
 
-    // Fire "comic/panel.generate" Inngest event for each panel
-    // Use step-based batch send to avoid partial failure blocking
-    const events = panels.map((panel) => ({
+    // Normalize for Inngest dispatch (handle both prompt and prompt_used)
+    const panelsForEvents = (insertedPanels as unknown as Array<{ id: string; comic_id: string; prompt_used?: string; prompt?: string }>).map((p) => ({
+      panelId: p.id,
+      prompt: (p as unknown as { prompt_used?: string; prompt?: string }).prompt_used || (p as unknown as { prompt?: string }).prompt || "",
+      comicId: p.comic_id,
+    }));
+
+    const events = panelsForEvents.map((panel) => ({
       name: "comic/panel.generate" as const,
       data: {
-        panelId: panel.id,
+        panelId: panel.panelId,
         prompt: panel.prompt,
         characterReferenceUrl: characterReferenceUrl,
-        comicId,
+        comicId: panel.comicId,
       },
     }));
 
@@ -111,12 +158,11 @@ export async function POST(req: NextRequest) {
       await inngest.send(events);
     } catch (inngestError) {
       console.error("[generate] Inngest send failed:", inngestError);
-      // Panels remain pending; caller can retry. Return partial success with warning.
       return NextResponse.json(
         {
           comicId,
           comic,
-          panels,
+          panels: insertedPanels,
           warning: `Comic and panels created but Inngest dispatch failed: ${String(inngestError)}`,
         },
         { status: 201 }
@@ -127,14 +173,23 @@ export async function POST(req: NextRequest) {
       {
         comicId,
         comic,
-        panels,
-        message: `Created comic with ${panels.length} panels. Generation jobs dispatched.`,
+        panels: insertedPanels,
+        message: `Created comic with ${(insertedPanels as unknown as unknown[]).length} panels. Generation jobs dispatched.`,
       },
       { status: 201 }
     );
   } catch (err: unknown) {
     console.error("[POST /api/comics/generate] error:", err);
     const message = err instanceof Error ? err.message : "Unknown error";
+    // Detect Invalid Compact JWS and give actionable hint
+    if (message.includes("Invalid Compact JWS")) {
+      return NextResponse.json(
+        {
+          error: `${message}. Hint: Check Vercel env NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set to the Comic project (hzegkbmgkvwhvtqdkuqr) legacy JWTs and redeploy.`,
+        },
+        { status: 500 }
+      );
+    }
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
