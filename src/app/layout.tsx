@@ -20,11 +20,20 @@ export default function RootLayout({
               COMIC<span className="text-indigo-600">STUDIO</span>
             </a>
             <nav className="flex items-center gap-3 text-sm">
+              <a href="/create" className="rounded-full bg-indigo-600 px-4 py-2 font-medium text-white hover:bg-indigo-700">
+                Create
+              </a>
+              <a href="/library" className="rounded-full border bg-white px-4 py-2 font-medium hover:bg-neutral-50">
+                Library
+              </a>
+              <a href="/environments" className="hidden rounded-full border bg-white px-4 py-2 font-medium hover:bg-neutral-50 sm:inline-block">
+                Environments
+              </a>
               <a
                 href="/comics/create"
-                className="rounded-full bg-neutral-900 px-4 py-2 font-medium text-white hover:bg-black"
+                className="hidden rounded-full bg-neutral-900 px-4 py-2 font-medium text-white hover:bg-black md:inline-block"
               >
-                Create Comic
+                Legacy
               </a>
             </nav>
           </div>

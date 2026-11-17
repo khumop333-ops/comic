@@ -17,39 +17,54 @@ export default function HomePage() {
         </p>
         <div className="mt-8 flex flex-wrap gap-3">
           <Link
-            href="/comics/create"
+            href="/create"
             className="rounded-full bg-indigo-600 px-6 py-3 text-sm font-semibold text-white hover:bg-indigo-700"
           >
-            Go to Comic Creator →
+            New: Create Issues →
+          </Link>
+          <Link
+            href="/library"
+            className="rounded-full bg-neutral-900 px-6 py-3 text-sm font-semibold text-white hover:bg-black"
+          >
+            Library
+          </Link>
+          <Link
+            href="/environments"
+            className="rounded-full border bg-white px-6 py-3 text-sm font-semibold hover:bg-neutral-50"
+          >
+            Environments
           </Link>
           <a
             href="/api/inngest"
             className="rounded-full border bg-white px-6 py-3 text-sm font-semibold hover:bg-neutral-50"
           >
-            Inngest endpoint
+            Inngest
           </a>
         </div>
         <div className="mt-10 grid gap-4 text-sm">
           <div className="rounded-xl bg-neutral-50 p-4">
-            <div className="font-semibold">1. Supabase</div>
+            <div className="font-semibold">1. Supabase — New Hierarchy</div>
             <div className="text-neutral-600">
-              Tables: <code>characters</code>, <code>comics</code>, <code>comic_panels</code> · Bucket:{" "}
-              <code>comic-assets</code>
+              <code>environments</code> · <code>issues</code> (issue_number) · <code>pages</code>{" "}
+              (page_number) · <code>issue_panels</code> + <code>panel_characters</code> junction —
+              ordered Issue→Page→Panel. Legacy <code>comics/comic_panels</code> still supported. Bucket{" "}
+              <code>comic-assets</code> paths: <code>characters/</code>, <code>environments/</code>,{" "}
+              <code>issue-panels/</code>
             </div>
           </div>
           <div className="rounded-xl bg-neutral-50 p-4">
-            <div className="font-semibold">2. Inngest Event</div>
+            <div className="font-semibold">2. Inngest Events</div>
             <div className="text-neutral-600">
-              <code>comic/panel.generate</code> with{" "}
-              <code>{"{ panelId, prompt, characterReferenceUrl, comicId }"}</code>
+              <code>comic/panel.generate</code> (legacy) & <code>issue/panel.generate</code>{" "}
+              (multi-char+env: <code>{`{ panelId, prompt, characterReferenceUrls[], environmentReferenceUrl, issueId, pageId }`}</code>)
             </div>
           </div>
           <div className="rounded-xl bg-neutral-50 p-4">
             <div className="font-semibold">3. GPU Worker</div>
             <div className="text-neutral-600">
-              POST <code>process.env.GPU_WORKER_URL</code> with{" "}
-              <code>{"{ prompt, character_reference_url }"}</code> → image → upload to{" "}
-              <code>/panels/${"{comicId}"}/${"{panelId}"}.png</code>
+              POST <code>GPU_WORKER_URL</code> with{" "}
+              <code>{`{ prompt, character_reference_urls, environment_reference_url }`}</code> → image
+              → <code>{`issue-panels/{issueId}/{pageId}/{panelId}.png`}</code>
             </div>
           </div>
         </div>
