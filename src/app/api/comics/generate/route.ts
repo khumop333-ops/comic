@@ -158,12 +158,20 @@ export async function POST(req: NextRequest) {
       await inngest.send(events);
     } catch (inngestError) {
       console.error("[generate] Inngest send failed:", inngestError);
+      const inngestMsg = String(inngestError);
+      const isMissingKey =
+        inngestMsg.includes("event key") ||
+        inngestMsg.includes("INNGEST_EVENT_KEY") ||
+        inngestMsg.includes("couldn't find an event key");
+      const hint = isMissingKey
+        ? " — Missing INNGEST_EVENT_KEY. Your comic/panels rows were created (polling will stay 'pending'), but background generation never started. Fix: Inngest dashboard → https://app.inngest.com/env/production/manage/keys → copy Event Key, then Vercel → comic-j6p9 (and comic) → Settings → Environment Variables → add INNGEST_EVENT_KEY (sensitive, all envs) + INNGEST_SIGNING_KEY (all envs) → redeploy. For local dev run `npx inngest-cli dev` or set INNGEST_EVENT_KEY in .env.local. Current branch preview needs the key too."
+        : "";
       return NextResponse.json(
         {
           comicId,
           comic,
           panels: insertedPanels,
-          warning: `Comic and panels created but Inngest dispatch failed: ${String(inngestError)}`,
+          warning: `Comic and panels created but Inngest dispatch failed: ${inngestMsg}${hint}`,
         },
         { status: 201 }
       );
