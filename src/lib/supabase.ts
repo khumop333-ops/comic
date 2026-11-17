@@ -20,6 +20,8 @@ const supabaseUrl =
 const supabaseAnonKey =
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
   process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.SUPABASE_PUBLISHABLE_KEY ||
   "";
 
 const supabaseServiceRoleKey =
@@ -82,12 +84,13 @@ export function getSupabaseBrowser() {
   // Prefer anon key for browser; fall back to service_role only if explicitly allowed (not recommended)
   const browserKey = supabaseAnonKey || supabaseServiceRoleKey;
   if (isPlaceholder(supabaseUrl) || isPlaceholder(browserKey)) {
-    if (typeof window !== "undefined") {
-      // Browser runtime — throw helpful error instead of silent Invalid JWS
-      console.error(
-        `[supabase:browser] Missing credentials — upload will fail as "Invalid Compact JWS". Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in .env.local and Vercel.`
-      );
-    }
+    // Throw early with friendly message — otherwise Supabase JS throws generic "supabaseKey is required"
+    const hint =
+      "Vercel preview/production needs NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY (or SUPABASE_ANON_KEY) set for all envs and redeployed. Current url=" +
+      supabaseUrl.slice(0, 40) +
+      " key=" +
+      browserKey.slice(0, 10);
+    throw new Error(`[supabase:browser] supabaseKey is required — missing anon key. ${hint}. If you see this after setting Vercel env, redeploy.`);
   }
   _supabaseBrowser = createClient(supabaseUrl, browserKey, {
     auth: { persistSession: false, autoRefreshToken: false },
@@ -107,8 +110,12 @@ export const supabase = new Proxy({} as ReturnType<typeof createClient>, {
 // Helper to detect and re-throw storage JWS errors with guidance
 export function friendlySupabaseError(error: { message: string } | null, context: string): string | null {
   if (!error) return null;
-  if (error.message.includes("Invalid Compact JWS") || error.message.includes("Invalid API key")) {
-    return `${context} failed: ${error.message}. This usually means Supabase URL/key are missing, placeholder, or using new sb_secret key where legacy JWT is expected. Check Vercel env NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (legacy service_role JWT), and redeploy. Current URL: ${supabaseUrl}`;
+  if (
+    error.message.includes("Invalid Compact JWS") ||
+    error.message.includes("Invalid API key") ||
+    error.message.includes("supabaseKey is required")
+  ) {
+    return `${context} failed: ${error.message}. This usually means Supabase URL/key are missing, placeholder, or using new sb_secret key where legacy JWT is expected. Check Vercel env NEXT_PUBLIC_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (legacy service_role JWT), NEXT_PUBLIC_SUPABASE_ANON_KEY for all envs (production/preview/development) and redeploy. Current URL: ${supabaseUrl}`;
   }
   return `${context} failed: ${error.message}`;
 }
