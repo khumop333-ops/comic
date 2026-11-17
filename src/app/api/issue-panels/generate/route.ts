@@ -100,20 +100,43 @@ export async function POST(req: NextRequest) {
     // Fetch reference URLs for Inngest payload
     const characterReferenceUrls = (chars as Array<{ reference_image_url: string }>).map((c) => c.reference_image_url);
 
-    await inngest.send({
-      name: "issue/panel.generate",
-      data: {
-        panelId,
-        prompt: enrichedPrompt,
-        originalPrompt: prompt.trim(),
-        characterIds,
-        characterReferenceUrls,
-        environmentId: environmentId || null,
-        environmentReferenceUrl: environmentUrl,
-        issueId,
-        pageId,
-      },
-    });
+    try {
+      await inngest.send({
+        name: "issue/panel.generate",
+        data: {
+          panelId,
+          prompt: enrichedPrompt,
+          originalPrompt: prompt.trim(),
+          characterIds,
+          characterReferenceUrls,
+          environmentId: environmentId || null,
+          environmentReferenceUrl: environmentUrl,
+          issueId,
+          pageId,
+        },
+      });
+    } catch (inngestError) {
+      console.error("[issue-panels generate] Inngest send failed:", inngestError);
+      const msg = String(inngestError);
+      const isMissingKey =
+        msg.includes("event key") ||
+        msg.includes("INNGEST_EVENT_KEY") ||
+        msg.includes("couldn't find an event key");
+      const hint = isMissingKey
+        ? " — Missing INNGEST_EVENT_KEY. Panel row was created (pending), but generation never started. Fix: Inngest → https://app.inngest.com/env/production/manage/keys → copy Event Key, then Vercel → comic-j6p9 (and comic) → Settings → Environment Variables → add INNGEST_EVENT_KEY (sensitive, all envs) + INNGEST_SIGNING_KEY (all envs) → redeploy."
+        : "";
+      // We already created DB rows; return 201 with warning so UI can retry after fixing env, instead of 500
+      return NextResponse.json(
+        {
+          panelId,
+          panelIndex: nextIndex,
+          issueId,
+          pageId,
+          warning: `Panel created but Inngest dispatch failed: ${msg}${hint}`,
+        },
+        { status: 201 }
+      );
+    }
 
     return NextResponse.json({ panelId, panelIndex: nextIndex, issueId, pageId }, { status: 201 });
   } catch (e) {
