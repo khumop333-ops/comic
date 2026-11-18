@@ -1,5 +1,6 @@
 import { inngest } from "../client";
 import { supabase, getSupabase, friendlySupabaseError } from "@/lib/supabase";
+import { callGpuWorker } from "@/inngest/helpers";
 
 export type GeneratePanelEventPayload = {
   panelId: string;
@@ -7,53 +8,6 @@ export type GeneratePanelEventPayload = {
   characterReferenceUrl: string;
   comicId: string;
 };
-
-type GpuWorkerResponseJson = {
-  image?: string;
-  image_url?: string;
-  url?: string;
-  output?: string;
-  result?: string;
-};
-
-function extractImageBuffer(
-  raw: ArrayBuffer | Buffer | Uint8Array,
-  contentType: string | null,
-  jsonCandidate?: GpuWorkerResponseJson | null
-): { buffer: Buffer; contentType: string } | null {
-  if (jsonCandidate) {
-    const b64 =
-      jsonCandidate.image ?? jsonCandidate.image_url ?? jsonCandidate.url ?? jsonCandidate.output ?? jsonCandidate.result;
-    if (b64 && typeof b64 === "string") {
-      if (b64.startsWith("http://") || b64.startsWith("https://")) return null;
-      const base64Data = b64.includes(",") ? b64.split(",")[1] : b64;
-      if (base64Data.length > 100) {
-        try {
-          const buffer = Buffer.from(base64Data, "base64");
-          return { buffer, contentType: "image/png" };
-        } catch {}
-      }
-    }
-  }
-
-  const buf: Buffer = Buffer.isBuffer(raw)
-    ? raw
-    : raw instanceof Uint8Array
-      ? Buffer.from(raw)
-      : Buffer.from(raw as ArrayBuffer);
-
-  if (contentType?.startsWith("image/")) return { buffer: buf, contentType };
-
-  if (buf.length > 4) {
-    const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
-    const isJpeg = buf[0] === 0xff && buf[1] === 0xd8;
-    if (isPng) return { buffer: buf, contentType: "image/png" };
-    if (isJpeg) return { buffer: buf, contentType: "image/jpeg" };
-  }
-
-  if (buf.length > 0) return { buffer: buf, contentType: contentType || "image/png" };
-  return null;
-}
 
 export const generatePanel = inngest.createFunction(
   {
@@ -63,99 +17,49 @@ export const generatePanel = inngest.createFunction(
     concurrency: { limit: 5 },
   },
   { event: "comic/panel.generate" },
-  async ({ event, step }) => {
+  async ({ event, step, logger }) => {
     const { panelId, prompt, characterReferenceUrl, comicId } = event.data as GeneratePanelEventPayload;
+    if (!panelId || !prompt || !comicId) throw new Error(`Missing payload: panelId=${panelId}, comicId=${comicId}`);
 
-    if (!panelId || !prompt || !comicId) {
-      throw new Error(`Missing required payload fields: panelId=${panelId}, comicId=${comicId}, prompt=${prompt?.slice(0, 50)}`);
-    }
-
-    // Validate Supabase config before any storage call — gives actionable error instead of raw JWS error
     try {
       getSupabase();
     } catch (configErr) {
-      // Mark panel as failed so UI shows error
-      await (supabase.from("comic_panels") as unknown as { update: (v: unknown) => { eq: (c: string, v: unknown) => Promise<unknown> } }).update({ status: "failed" }).eq("id", panelId);
+      await (supabase.from("comic_panels") as unknown as { update: (v: unknown) => { eq: (c: string, v: unknown) => Promise<unknown> } }).update({ status: "failed", error_message: String(configErr).slice(0, 500) }).eq("id", panelId);
       throw new Error(String(configErr));
     }
 
+    logger.info("Generating panel", { panelId, comicId, prompt: prompt.slice(0, 80) });
+
     const imageResult = await step.run("call-gpu-worker", async () => {
-      const gpuWorkerUrl = process.env.GPU_WORKER_URL;
-      if (!gpuWorkerUrl) throw new Error("GPU_WORKER_URL env var is not set");
-
-      const res = await fetch(gpuWorkerUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, character_reference_url: characterReferenceUrl }),
-      });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        throw new Error(`GPU worker failed: ${res.status} ${res.statusText} — ${text.slice(0, 500)}`);
-      }
-
-      const contentType = res.headers.get("content-type") || "";
-
-      if (contentType.includes("application/json")) {
-        const json = (await res.json()) as GpuWorkerResponseJson;
-        const remoteUrl = json.image_url || json.url;
-        if (remoteUrl && (remoteUrl.startsWith("http://") || remoteUrl.startsWith("https://"))) {
-          const imgRes = await fetch(remoteUrl);
-          if (!imgRes.ok) throw new Error(`Failed to fetch remote image: ${imgRes.status}`);
-          const buf = await imgRes.arrayBuffer();
-          const ext = extractImageBuffer(buf, imgRes.headers.get("content-type") || "image/png", null);
-          if (!ext) throw new Error("Failed to extract remote image");
-          return { base64: ext.buffer.toString("base64"), contentType: ext.contentType };
-        }
-        const extracted = extractImageBuffer(Buffer.from(""), contentType, json);
-        if (extracted) return { base64: extracted.buffer.toString("base64"), contentType: extracted.contentType };
-        throw new Error(`GPU worker returned JSON without recognizable image field: ${JSON.stringify(json).slice(0, 500)}`);
-      } else {
-        const arrayBuffer = await res.arrayBuffer();
-        const extracted = extractImageBuffer(arrayBuffer, contentType, null);
-        if (!extracted) throw new Error("GPU worker returned empty image");
-        return { base64: extracted.buffer.toString("base64"), contentType: extracted.contentType };
-      }
+      return callGpuWorker({ prompt, character_reference_url: characterReferenceUrl, character_reference_urls: [characterReferenceUrl] });
     });
 
     const publicUrl = await step.run("upload-to-supabase-storage", async () => {
       const filePath = `panels/${comicId}/${panelId}.png`;
-
-      // Inngest serializes step outputs, so we passed base64 (not Buffer) to survive JSON serialization
       const buffer = Buffer.from(imageResult.base64, "base64");
       const fileBlob = new Blob([new Uint8Array(buffer)], { type: imageResult.contentType || "image/png" });
-
-      // Use service_role client (bypasses RLS). Validate before upload.
       const client = getSupabase();
-
       const { error: uploadError } = await client.storage.from("comic-assets").upload(filePath, fileBlob, {
         contentType: imageResult.contentType || "image/png",
         upsert: true,
         cacheControl: "3600",
       });
-
       if (uploadError) {
-        // Provide friendly guidance for Invalid Compact JWS
         const friendly = friendlySupabaseError(uploadError as { message: string }, "Supabase storage upload");
         if (friendly?.includes("Invalid Compact JWS")) {
-          // Mark as failed and throw with hint
-          await (client.from("comic_panels") as unknown as { update: (v: unknown) => { eq: (c: string, v: unknown) => Promise<unknown> } }).update({ status: "failed" }).eq("id", panelId);
-          throw new Error(
-            `${friendly} — This commit uses ${process.env.NEXT_PUBLIC_SUPABASE_URL || "missing URL"}. Ensure Vercel env SUPABASE_SERVICE_ROLE_KEY is the legacy service_role JWT (eyJ...) for Comic project hzegkbmgkvwhvtqdkuqr, not the new sb_secret key, and redeploy.`
-          );
+          await (client.from("comic_panels") as unknown as { update: (v: unknown) => { eq: (c: string, v: unknown) => Promise<unknown> } }).update({ status: "failed", error_message: friendly.slice(0, 500) }).eq("id", panelId);
+          throw new Error(`${friendly} — Check SUPABASE_SERVICE_ROLE_KEY (legacy JWT) and redeploy.`);
         }
         throw new Error(friendly || uploadError.message);
       }
-
       const { data } = client.storage.from("comic-assets").getPublicUrl(filePath);
-      if (!data?.publicUrl) throw new Error("Failed to get public URL from Supabase storage");
+      if (!data?.publicUrl) throw new Error("Failed to get public URL");
       return data.publicUrl;
     });
 
     await step.run("update-panel-status", async () => {
       const client = getSupabase();
-      // Actual DB columns: image_url, status — both exist in Comic project
-      const { error } = await (client.from("comic_panels") as unknown as { update: (v: unknown) => { eq: (c: string, v: unknown) => Promise<{ error: { message: string } | null }> } }).update({ image_url: publicUrl, status: "completed" }).eq("id", panelId);
+      const { error } = await (client.from("comic_panels") as unknown as { update: (v: unknown) => { eq: (c: string, v: unknown) => Promise<{ error: { message: string } | null }> } }).update({ image_url: publicUrl, status: "completed", error_message: null }).eq("id", panelId);
       if (error) {
         const friendly = friendlySupabaseError(error as { message: string }, "Update comic_panels");
         throw new Error(friendly || error.message);
@@ -163,6 +67,7 @@ export const generatePanel = inngest.createFunction(
       return { panelId, publicUrl };
     });
 
+    logger.info("Panel completed", { panelId, publicUrl });
     return { panelId, comicId, imageUrl: publicUrl };
   }
 );
