@@ -1,26 +1,31 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { supabase } from "@/lib/supabase";
 
 export const runtime = "nodejs";
 
-// GET /api/library — full ordered catalog issues -> pages -> panels
-export async function GET() {
-  const { data: issues, error: issuesErr } = await supabase
-    .from("issues")
-    .select("id, title, issue_number, description, cover_image_url, created_at")
-    .order("issue_number", { ascending: true });
+export async function GET(req: NextRequest) {
+  const url = req.nextUrl;
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 100);
+  const issueId = url.searchParams.get("issue_id"); // optional filter
 
+  // Support ETag / caching
+  const ifNoneMatch = req.headers.get("if-none-match");
+
+  let issuesQuery = supabase.from("issues").select("id, title, issue_number, description, cover_image_url, created_at").order("issue_number", { ascending: true });
+
+  if (issueId) {
+    issuesQuery = supabase.from("issues").select("id, title, issue_number, description, cover_image_url, created_at").eq("id", issueId);
+  } else {
+    issuesQuery = issuesQuery.range(0, limit - 1);
+  }
+
+  const { data: issues, error: issuesErr } = await issuesQuery;
   if (issuesErr) return NextResponse.json({ error: issuesErr.message }, { status: 500 });
   if (!issues || issues.length === 0) return NextResponse.json({ issues: [] });
 
   const issueIds = (issues as Array<{ id: string }>).map((i) => i.id);
 
-  const { data: pages, error: pagesErr } = await supabase
-    .from("pages")
-    .select("id, issue_id, page_number, title, created_at")
-    .in("issue_id", issueIds)
-    .order("page_number", { ascending: true });
-
+  const { data: pages, error: pagesErr } = await supabase.from("pages").select("id, issue_id, page_number, title, created_at").in("issue_id", issueIds).order("page_number", { ascending: true });
   if (pagesErr) return NextResponse.json({ error: pagesErr.message }, { status: 500 });
 
   const pageIds = (pages as Array<{ id: string }>)?.map((p) => p.id) ?? [];
@@ -33,7 +38,7 @@ export async function GET() {
   if (pageIds.length > 0) {
     const { data: panelsData, error: panelsErr } = await supabase
       .from("issue_panels")
-      .select("id, issue_id, page_id, panel_index, prompt, image_url, status, environment_id, created_at")
+      .select("id, issue_id, page_id, panel_index, prompt, image_url, status, environment_id, error_message, created_at")
       .in("page_id", pageIds)
       .order("panel_index", { ascending: true });
     if (panelsErr) return NextResponse.json({ error: panelsErr.message }, { status: 500 });
@@ -41,18 +46,13 @@ export async function GET() {
 
     const panelIds = (panels as Array<{ id: string }>).map((p) => p.id);
     if (panelIds.length > 0) {
-      const { data: pcData } = await supabase
-        .from("panel_characters")
-        .select("panel_id, character_id")
-        .in("panel_id", panelIds);
+      const { data: pcData } = await supabase.from("panel_characters").select("panel_id, character_id").in("panel_id", panelIds);
       panelCharacters = (pcData as unknown[]) ?? [];
-
       const charIds = [...new Set((panelCharacters as Array<{ character_id: string }>).map((r) => r.character_id))];
       if (charIds.length > 0) {
         const { data: chars } = await supabase.from("characters").select("id, name, reference_image_url").in("id", charIds);
         for (const c of (chars as Array<{ id: string; name: string; reference_image_url: string }>) ?? []) charactersById[c.id] = c;
       }
-
       const envIds = [...new Set((panels as Array<{ environment_id: string | null }>).map((p) => p.environment_id).filter(Boolean) as string[])];
       if (envIds.length > 0) {
         const { data: envs } = await supabase.from("environments").select("id, name, reference_image_url").in("id", envIds);
@@ -61,7 +61,6 @@ export async function GET() {
     }
   }
 
-  // Group pages by issue, panels by page
   const pagesByIssue = new Map<string, typeof pages>();
   for (const p of (pages as Array<{ issue_id: string }>) ?? []) {
     const arr = pagesByIssue.get(p.issue_id) ?? [];
@@ -86,25 +85,23 @@ export async function GET() {
   const enrichedIssues = (issues as Array<{ id: string }>).map((issue) => {
     const issuePages = pagesByIssue.get(issue.id) ?? [];
     const enrichedPages = (issuePages as Array<{ id: string }>).map((page) => {
-      const pagePanels = (panelsByPage.get(page.id) ?? []) as Array<{
-        id: string;
-        environment_id: string | null;
-        panel_index: number;
-      }>;
+      const pagePanels = (panelsByPage.get(page.id) ?? []) as Array<{ id: string; environment_id: string | null; panel_index: number }>;
       const enrichedPanels = pagePanels
         .sort((a, b) => a.panel_index - b.panel_index)
         .map((panel) => {
           const charIds = pcByPanel.get(panel.id) ?? [];
-          return {
-            ...panel,
-            characters: charIds.map((cid) => charactersById[cid]).filter(Boolean),
-            environment: panel.environment_id ? environmentsById[panel.environment_id] ?? null : null,
-          };
+          return { ...panel, characters: charIds.map((cid) => charactersById[cid]).filter(Boolean), environment: panel.environment_id ? environmentsById[panel.environment_id] ?? null : null };
         });
       return { ...page, panels: enrichedPanels };
     });
     return { ...issue, pages: enrichedPages };
   });
 
-  return NextResponse.json({ issues: enrichedIssues });
+  const body = JSON.stringify({ issues: enrichedIssues });
+  // simple ETag
+  const etag = `W/"${body.length}-${enrichedIssues.length}"`;
+  if (ifNoneMatch === etag) return new NextResponse(null, { status: 304 });
+
+  const res = new NextResponse(body, { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "public, s-maxage=15, stale-while-revalidate=60", ETag: etag } });
+  return res;
 }
